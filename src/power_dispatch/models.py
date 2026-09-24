@@ -260,3 +260,140 @@ class SupplyScenario:
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
         )
+
+
+def period_number(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 24:
+        raise ValidationFailed(f"{field} 必须是 1 到 24 的时段编号")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationUnit:
+    unit_id: str
+    name: str
+    facility_id: str
+    fuel_product: str
+    min_output_mwh: Decimal
+    max_output_mwh: Decimal
+    ramp_up_mwh: Decimal
+    ramp_down_mwh: Decimal
+    startup_cost_cny: Decimal
+    marginal_cost_cny: Decimal
+    fuel_factor: Decimal
+    initial_output_mwh: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "GenerationUnit":
+        fuel_product = required_text(raw.get("fuel_product"), "fuel_product", 32)
+        if fuel_product not in PRODUCTS:
+            raise ValidationFailed("fuel_product 不是受支持的电源类型")
+        minimum = decimal_value(raw.get("min_output_mwh"), "min_output_mwh", minimum=Decimal("0"))
+        maximum = decimal_value(raw.get("max_output_mwh"), "max_output_mwh", minimum=Decimal("0.001"))
+        if minimum > maximum:
+            raise ValidationFailed("min_output_mwh 不能大于 max_output_mwh")
+        initial = decimal_value(raw.get("initial_output_mwh", 0), "initial_output_mwh", minimum=Decimal("0"))
+        if initial > maximum:
+            raise ValidationFailed("initial_output_mwh 不能大于 max_output_mwh")
+        if Decimal("0") < initial < minimum:
+            raise ValidationFailed("initial_output_mwh 在役时不能低于 min_output_mwh")
+        return cls(
+            unit_id=identifier(raw.get("unit_id"), "unit_id"),
+            name=required_text(raw.get("name"), "name"),
+            facility_id=identifier(raw.get("facility_id"), "facility_id"),
+            fuel_product=fuel_product,
+            min_output_mwh=minimum,
+            max_output_mwh=maximum,
+            ramp_up_mwh=decimal_value(raw.get("ramp_up_mwh"), "ramp_up_mwh", minimum=Decimal("0.001")),
+            ramp_down_mwh=decimal_value(raw.get("ramp_down_mwh"), "ramp_down_mwh", minimum=Decimal("0.001")),
+            startup_cost_cny=decimal_value(raw.get("startup_cost_cny", 0), "startup_cost_cny", minimum=Decimal("0")),
+            marginal_cost_cny=decimal_value(raw.get("marginal_cost_cny", 0), "marginal_cost_cny", minimum=Decimal("0")),
+            fuel_factor=decimal_value(raw.get("fuel_factor", 1), "fuel_factor", minimum=Decimal("0.000001")),
+            initial_output_mwh=initial,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceWindow:
+    unit_id: str
+    trade_date: str
+    start_period: int
+    end_period: int
+    reason: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "MaintenanceWindow":
+        start = period_number(raw.get("start_period"), "start_period")
+        end = period_number(raw.get("end_period"), "end_period")
+        if end < start:
+            raise ValidationFailed("end_period 不能早于 start_period")
+        return cls(
+            unit_id=identifier(raw.get("unit_id"), "unit_id"),
+            trade_date=date_text(raw.get("trade_date"), "trade_date"),
+            start_period=start,
+            end_period=end,
+            reason=required_text(raw.get("reason"), "reason"),
+        )
+
+
+def period_series(raw: object, field: str) -> dict[int, Decimal]:
+    """解析 24 个时段的序列：接受 [{period, value_field}] 形式。"""
+    if not isinstance(raw, list) or len(raw) != 24:
+        raise ValidationFailed(f"{field} 必须包含 24 个时段")
+    series: dict[int, Decimal] = {}
+    for index, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise ValidationFailed(f"{field}[{index}] 必须是对象")
+        period = period_number(item.get("period"), f"{field}[{index}].period")
+        if period in series:
+            raise ValidationFailed(f"{field} 时段 {period} 重复")
+        value_field = "price_cny" if field == "price_points" else "demand_mwh"
+        series[period] = decimal_value(item.get(value_field), f"{field}[{index}].{value_field}", minimum=Decimal("0"))
+    return series
+
+
+@dataclass(frozen=True, slots=True)
+class PriceCurve:
+    price_version_id: str
+    trade_date: str
+    source_revision: str
+    points: Mapping[int, Decimal]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PriceCurve":
+        return cls(
+            price_version_id=identifier(raw.get("price_version_id"), "price_version_id"),
+            trade_date=date_text(raw.get("trade_date"), "trade_date"),
+            source_revision=identifier(raw.get("source_revision"), "source_revision"),
+            points=period_series(raw.get("price_points"), "price_points"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationPlanRequest:
+    plan_id: str
+    trade_date: str
+    price_version_id: str
+    reserve_percent: Decimal
+    demand: Mapping[int, Decimal]
+    unit_ids: tuple[str, ...]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "GenerationPlanRequest":
+        unit_ids_raw = raw.get("unit_ids")
+        if unit_ids_raw is None:
+            unit_ids: tuple[str, ...] = ()
+        else:
+            if not isinstance(unit_ids_raw, list) or not unit_ids_raw:
+                raise ValidationFailed("unit_ids 必须是非空数组或省略")
+            unit_ids = tuple(identifier(value, "unit_ids") for value in unit_ids_raw)
+        return cls(
+            plan_id=identifier(raw.get("plan_id"), "plan_id"),
+            trade_date=date_text(raw.get("trade_date"), "trade_date"),
+            price_version_id=identifier(raw.get("price_version_id"), "price_version_id"),
+            reserve_percent=decimal_value(
+                raw.get("reserve_percent", 0), "reserve_percent", minimum=Decimal("0"), maximum=Decimal("100")
+            ),
+            demand=period_series(raw.get("demand_points"), "demand_points"),
+            unit_ids=unit_ids,
+        )

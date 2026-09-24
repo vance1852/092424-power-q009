@@ -194,6 +194,115 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+CREATE TABLE IF NOT EXISTS generation_units (
+    unit_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    facility_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    fuel_product TEXT NOT NULL,
+    min_output_mwh TEXT NOT NULL,
+    max_output_mwh TEXT NOT NULL,
+    ramp_up_mwh TEXT NOT NULL,
+    ramp_down_mwh TEXT NOT NULL,
+    startup_cost_cny TEXT NOT NULL,
+    marginal_cost_cny TEXT NOT NULL,
+    fuel_factor TEXT NOT NULL,
+    initial_output_mwh TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS unit_maintenance_windows (
+    window_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    unit_id TEXT NOT NULL REFERENCES generation_units(unit_id),
+    trade_date TEXT NOT NULL,
+    start_period INTEGER NOT NULL CHECK(start_period BETWEEN 1 AND 24),
+    end_period INTEGER NOT NULL CHECK(end_period BETWEEN 1 AND 24),
+    reason TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    CHECK(end_period >= start_period)
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_unit_date
+ON unit_maintenance_windows(unit_id, trade_date);
+
+CREATE TABLE IF NOT EXISTS price_curves (
+    price_version_id TEXT PRIMARY KEY,
+    trade_date TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    points_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    supersedes_price_version_id TEXT REFERENCES price_curves(price_version_id),
+    recorded_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    recorded_at TEXT NOT NULL,
+    UNIQUE(trade_date, source_revision)
+);
+
+CREATE TABLE IF NOT EXISTS generation_plans (
+    plan_id TEXT PRIMARY KEY,
+    trade_date TEXT NOT NULL,
+    price_version_id TEXT NOT NULL REFERENCES price_curves(price_version_id),
+    reserve_percent TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL UNIQUE,
+    result_json TEXT,
+    conflicts_json TEXT,
+    state TEXT NOT NULL CHECK(state IN ('draft','infeasible','approved','superseded')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    fuel_reserved INTEGER NOT NULL DEFAULT 0 CHECK(fuel_reserved IN (0,1)),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    approved_by TEXT REFERENCES supply_users(user_id),
+    approved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS plan_unit_schedules (
+    plan_id TEXT NOT NULL REFERENCES generation_plans(plan_id),
+    period INTEGER NOT NULL CHECK(period BETWEEN 1 AND 24),
+    unit_id TEXT NOT NULL,
+    committed INTEGER NOT NULL CHECK(committed IN (0,1)),
+    started INTEGER NOT NULL CHECK(started IN (0,1)),
+    output_mwh TEXT NOT NULL,
+    startup_cost_cny TEXT NOT NULL,
+    energy_cost_cny TEXT NOT NULL,
+    PRIMARY KEY(plan_id, period, unit_id)
+);
+
+CREATE TABLE IF NOT EXISTS fuel_reservations (
+    reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL UNIQUE REFERENCES generation_plans(plan_id),
+    state TEXT NOT NULL DEFAULT 'held' CHECK(state IN ('held','consumed','released')),
+    total_reserved_mwh TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fuel_reservation_items (
+    reservation_id INTEGER NOT NULL REFERENCES fuel_reservations(reservation_id),
+    lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    facility_id TEXT NOT NULL,
+    fuel_product TEXT NOT NULL,
+    reserved_mwh TEXT NOT NULL,
+    lot_revision INTEGER NOT NULL,
+    PRIMARY KEY(reservation_id, lot_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_actuals (
+    plan_id TEXT NOT NULL REFERENCES generation_plans(plan_id),
+    period INTEGER NOT NULL CHECK(period BETWEEN 1 AND 24),
+    unit_id TEXT NOT NULL,
+    output_mwh TEXT NOT NULL,
+    reported_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    reported_at TEXT NOT NULL,
+    PRIMARY KEY(plan_id, period, unit_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_actuals_plan
+ON plan_actuals(plan_id, period, unit_id);
 """
 
 

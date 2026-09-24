@@ -83,11 +83,31 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/units":
+                return Response(201, self.service.create_generation_unit(actor, payload))
+            if method == "POST" and path == "/units/maintenance":
+                return Response(201, self.service.announce_maintenance(actor, payload))
+            if method == "POST" and path == "/price-curves":
+                return Response(201, self.service.record_price_curve(actor, payload))
+            if method == "POST" and path == "/plans/compute":
+                return Response(201, self.service.compute_plan(actor, payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "plans" and parts[2] == "approve":
+                return Response(200, self.service.approve_plan(actor, parts[1], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "plans" and parts[2] == "actuals":
+                return Response(200, self.service.report_actual(actor, {**payload, "plan_id": parts[1]}))
+            if method == "GET" and len(parts) == 3 and parts[0] == "plans" and parts[2] == "deviation":
+                return Response(200, self.service.plan_deviation(actor, parts[1]))
+            if method == "GET" and len(parts) == 2 and parts[0] == "plans":
+                return Response(200, self.service.get_plan(actor, parts[1]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+            conflicts = getattr(exc, "conflicts", None)
+            if conflicts is not None:
+                error["conflicts"] = conflicts
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
