@@ -7,11 +7,11 @@ import json
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import CRUDE_GRADES, PRODUCTS, IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario, date_text, decimal_value, identifier
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -28,14 +28,17 @@ from .planning import (
     weighted_inventory_cost,
 )
 from .storage import initialize, transaction
+from .unit_schedule import ZERO, PlanRequest, UnitParameters, qmw, solve_schedule
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "planner": {"quote.write", "curve.write", "catalog.write", "unit.write", "maintenance.write", "plan.write", "plan.read", "scenario.write", "scenario.run"},
+    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write", "plan.approve", "plan.read", "actual.write"},
+    "risk": {"outage.write", "scenario.approve", "report.read", "plan.read"},
+    "auditor": {"report.read", "audit.read", "plan.read"},
 }
+
+SOLVER_VERSION = "unit_schedule:1"
 
 
 class SupplyService:
@@ -547,6 +550,565 @@ class SupplyService:
             run_id = int(cursor.lastrowid)
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
         return {"run_id": run_id, **result, "replayed": False}
+
+    # ------------------------------------------------------------------
+    # 次日机组出力计划
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hour_series(raw: Mapping[str, Any], field: str) -> list[Decimal]:
+        value = raw.get(field)
+        if not isinstance(value, (list, tuple)) or len(value) != 24:
+            raise ValidationFailed(f"{field} 必须是 24 个小时点")
+        return [decimal_value(point, f"{field}[{index}]") for index, point in enumerate(value)]
+
+    def record_price_curve(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """登记次日 24 点峰谷价格曲线版本；同一来源修订不覆盖。"""
+        self._require(actor_id, "curve.write")
+        market_index = str(raw.get("market_index", "")).strip().upper()
+        if market_index not in CRUDE_GRADES - {"CUSTOM"}:
+            raise ValidationFailed("market_index 必须是受支持的基准电价")
+        trade_date = date_text(raw.get("trade_date"), "trade_date")
+        source_revision = identifier(raw.get("source_revision"), "source_revision")
+        points = self._hour_series(raw, "prices")
+        if any(point < 0 for point in points):
+            raise ValidationFailed("电价不能为负数")
+        points_text = [decimal_text(point) for point in points]
+        content = canonical_json({
+            "market_index": market_index,
+            "trade_date": trade_date,
+            "source_revision": source_revision,
+            "prices": points_text,
+        })
+        content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        try:
+            with transaction(self.connection, immediate=True):
+                cursor = self.connection.execute(
+                    "INSERT INTO price_curve_versions(market_index,trade_date,source_revision,points_json,"
+                    "recorded_by,created_at) VALUES(?,?,?,?,?,?)",
+                    (market_index, trade_date, source_revision, content, actor_id, self._now()),
+                )
+                curve_id = int(cursor.lastrowid)
+                self._audit("price_curve", str(curve_id), "price_curve.recorded", actor_id,
+                            {"sha256": content_sha256, "trade_date": trade_date})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("同一价格曲线来源修订已登记") from exc
+        return {
+            "curve_id": curve_id,
+            "market_index": market_index,
+            "trade_date": trade_date,
+            "source_revision": source_revision,
+            "prices": points_text,
+            "sha256": content_sha256,
+        }
+
+    def _latest_curve(self, market_index: str, trade_date: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM price_curve_versions WHERE market_index=? AND trade_date=? "
+            "ORDER BY curve_id DESC LIMIT 1",
+            (market_index.upper(), trade_date),
+        ).fetchone()
+        if row is None:
+            raise NotFound("该结算日没有峰谷价格曲线版本")
+        return row
+
+    def price_curve(self, actor_id: str, market_index: str, trade_date: str) -> dict[str, Any]:
+        self._require(actor_id, "plan.read")
+        row = self._latest_curve(market_index, trade_date)
+        body = json.loads(row["points_json"])
+        return {"curve_id": row["curve_id"], **body}
+
+    def register_unit(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """登记机组参数版本；参数变化产生新版本，旧版本被保留以重放历史计划。"""
+        self._require(actor_id, "unit.write")
+        unit = UnitParameters.from_dict(raw)
+        facility_id = identifier(raw.get("facility_id"), "facility_id")
+        product = str(raw.get("product", "")).strip()
+        if product not in PRODUCTS:
+            raise ValidationFailed("product 不是受支持的电源类型")
+        facility = self.connection.execute(
+            "SELECT facility_id FROM facilities WHERE facility_id=?", (facility_id,)
+        ).fetchone()
+        if facility is None:
+            raise NotFound("设施不存在")
+        params = unit.as_dict()
+        content = canonical_json({"facility_id": facility_id, "product": product, "params": params})
+        content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        existing_same = self.connection.execute(
+            "SELECT * FROM generation_unit_revisions WHERE unit_id=? AND content_sha256=?",
+            (unit.unit_id, content_sha256),
+        ).fetchone()
+        if existing_same is not None:  # 相同内容重复登记：幂等返回现有版本。
+            return {"unit_id": unit.unit_id, "revision": existing_same["revision"],
+                    "state": existing_same["state"], "sha256": content_sha256, "unchanged": True}
+        try:
+            with transaction(self.connection, immediate=True):
+                identity = self.connection.execute(
+                    "SELECT * FROM generation_units WHERE unit_id=?", (unit.unit_id,)
+                ).fetchone()
+                if identity is None:
+                    revision = 1
+                    self.connection.execute(
+                        "INSERT INTO generation_units(unit_id,facility_id,product,current_revision,"
+                        "created_by,created_at) VALUES(?,?,?,?,?,?)",
+                        (unit.unit_id, facility_id, product, revision, actor_id, self._now()),
+                    )
+                else:
+                    if identity["facility_id"] != facility_id or identity["product"] != product:
+                        raise Conflict("机组所属设施与电源类型不可变更")
+                    revision = int(identity["current_revision"]) + 1
+                    self.connection.execute(
+                        "UPDATE generation_unit_revisions SET state='retired' "
+                        "WHERE unit_id=? AND state='active'",
+                        (unit.unit_id,),
+                    )
+                self.connection.execute(
+                    "INSERT INTO generation_unit_revisions(unit_id,revision,name,params_json,"
+                    "content_sha256,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (unit.unit_id, revision, unit.name, canonical_json(params),
+                     content_sha256, actor_id, self._now()),
+                )
+                self.connection.execute(
+                    "UPDATE generation_units SET current_revision=? WHERE unit_id=?",
+                    (revision, unit.unit_id),
+                )
+                self._audit("generation_unit", unit.unit_id, "unit.registered", actor_id,
+                            {"sha256": content_sha256, "facility_id": facility_id, "revision": revision})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("机组登记冲突") from exc
+        return {"unit_id": unit.unit_id, "revision": revision, "state": "active",
+                "sha256": content_sha256, "unchanged": False}
+
+    def _active_units(self, facility_id: str, product: str, unit_ids: tuple[str, ...] | None) -> list[sqlite3.Row]:
+        rows = self.connection.execute(
+            "SELECT r.*,u.facility_id,u.product FROM generation_unit_revisions r "
+            "JOIN generation_units u ON u.unit_id=r.unit_id "
+            "WHERE u.facility_id=? AND u.product=? AND r.state='active'",
+            (facility_id, product),
+        ).fetchall()
+        if unit_ids is not None:
+            selected = set(unit_ids)
+            rows = [row for row in rows if row["unit_id"] in selected]
+            found = {row["unit_id"] for row in rows}
+            missing = sorted(selected - found)
+            if missing:
+                raise NotFound(f"机组不存在或未在役: {','.join(missing)}")
+        if not rows:
+            raise NotFound("没有可参与计划的在役机组")
+        rows.sort(key=lambda row: row["unit_id"])
+        return rows
+
+    def declare_maintenance(
+        self,
+        actor_id: str,
+        unit_id: str,
+        trade_date: str,
+        start_hour: int,
+        end_hour: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """登记某日的机组检修禁运窗口（小时区间，end_hour=24 表示含第 23 时段）。"""
+        self._require(actor_id, "maintenance.write")
+        unit = self.connection.execute(
+            "SELECT u.unit_id FROM generation_units u "
+            "JOIN generation_unit_revisions r ON r.unit_id=u.unit_id AND r.revision=u.current_revision "
+            "WHERE u.unit_id=? AND r.state='active'",
+            (unit_id,),
+        ).fetchone()
+        if unit is None:
+            raise NotFound("在役机组不存在")
+        day = date_text(trade_date, "trade_date")
+        if isinstance(start_hour, bool) or not isinstance(start_hour, int) or not 0 <= start_hour <= 23:
+            raise ValidationFailed("start_hour 必须是 0 到 23 的整数")
+        if isinstance(end_hour, bool) or not isinstance(end_hour, int) or not 1 <= end_hour <= 24:
+            raise ValidationFailed("end_hour 必须是 1 到 24 的整数")
+        if end_hour <= start_hour:
+            raise ValidationFailed("检修窗口 end_hour 必须晚于 start_hour")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationFailed("reason 不能为空")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO unit_maintenance_windows(unit_id,trade_date,start_hour,end_hour,reason,"
+                "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                (unit_id, day, start_hour, end_hour, reason.strip(), actor_id, self._now()),
+            )
+            window_id = int(cursor.lastrowid)
+            self._audit("generation_unit", unit_id, "maintenance.declared", actor_id,
+                        {"window_id": window_id, "trade_date": day,
+                         "hours": [start_hour, end_hour]})
+        return {"window_id": window_id, "unit_id": unit_id, "trade_date": day,
+                "start_hour": start_hour, "end_hour": end_hour}
+
+    def _maintenance_map(self, unit_rows: Sequence[sqlite3.Row], trade_date: str) -> dict[str, frozenset[int]]:
+        blocked: dict[str, frozenset[int]] = {}
+        for row in unit_rows:
+            windows = self.connection.execute(
+                "SELECT start_hour,end_hour FROM unit_maintenance_windows WHERE unit_id=? AND trade_date=?",
+                (row["unit_id"], trade_date),
+            ).fetchall()
+            hours: set[int] = set()
+            for window in windows:
+                hours.update(range(window["start_hour"], window["end_hour"]))
+            if hours:
+                blocked[row["unit_id"]] = frozenset(hours)
+        return blocked
+
+    def _inventory_version(self, facility_id: str, product: str) -> tuple[str, Decimal]:
+        """以当前全部燃料批次的修订号和可用量构成库存版本，返回摘要与加权单价。"""
+        rows = self.connection.execute(
+            "SELECT lot_id,available_mwh,unit_cost_cny,revision FROM inventory_lots "
+            "WHERE facility_id=? AND product=? ORDER BY lot_id",
+            (facility_id, product),
+        ).fetchall()
+        snapshot = [
+            {"lot_id": row["lot_id"], "available_mwh": row["available_mwh"],
+             "unit_cost_cny": row["unit_cost_cny"], "revision": row["revision"]}
+            for row in rows
+        ]
+        summary = weighted_inventory_cost(rows)
+        unit_cost = Decimal(summary["weighted_unit_cost_cny"]) if Decimal(summary["available_mwh"]) > 0 else ZERO
+        return digest(snapshot), unit_cost
+
+    def compute_plan(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """计算（或重算）次日机组出力草稿。草稿不预留任何燃料。
+
+        同一 plan_id 以输入指纹幂等：输入未变则重放已保存结果；输入变化时
+        旧草稿被标记为 superseded 并生成新版本，批准后的计划不可再计算。
+        """
+        self._require(actor_id, "plan.write")
+        request = PlanRequest.from_dict(raw)
+        unit_rows = self._active_units(request.facility_id, request.product, request.unit_ids)
+        units = [UnitParameters.from_dict(json.loads(row["params_json"])) for row in unit_rows]
+        if request.quote_id is not None:
+            curve_row = self.connection.execute(
+                "SELECT * FROM price_curve_versions WHERE curve_id=?", (request.quote_id,)
+            ).fetchone()
+            if curve_row is None:
+                raise NotFound("价格曲线版本不存在")
+            if curve_row["trade_date"] != request.trade_date:
+                raise ValidationFailed("价格曲线版本与计划结算日不一致")
+            curve_snapshot = {
+                "kind": "curve_version",
+                "curve_id": curve_row["curve_id"],
+                "points_json": json.loads(curve_row["points_json"]),
+            }
+            curve_prices = tuple(Decimal(p) for p in curve_snapshot["points_json"]["prices"])
+        else:
+            curve_row = self.connection.execute(
+                "SELECT * FROM price_curve_versions WHERE trade_date=? ORDER BY curve_id DESC LIMIT 1",
+                (request.trade_date,),
+            ).fetchone()
+            if curve_row is not None:
+                curve_snapshot = {
+                    "kind": "curve_version",
+                    "curve_id": curve_row["curve_id"],
+                    "points_json": json.loads(curve_row["points_json"]),
+                }
+                curve_prices = tuple(Decimal(p) for p in curve_snapshot["points_json"]["prices"])
+            else:
+                curve_snapshot = {"kind": "inline", "prices": [decimal_text(p) for p in request.prices]}
+                curve_prices = request.prices
+        if curve_prices != request.prices:
+            raise Conflict("请求价格曲线与所引用版本不一致")
+
+        blocked = self._maintenance_map(unit_rows, request.trade_date)
+        inventory_sha256, fuel_unit_cost = self._inventory_version(request.facility_id, request.product)
+        for uid, output in request.initial_output_mw.items():
+            if not any(row["unit_id"] == uid for row in unit_rows):
+                raise ValidationFailed(f"initial_output_mw 引用了未参与计划的机组 {uid}")
+        input_value = {
+            "solver_version": SOLVER_VERSION,
+            "request": canonical_json(raw),
+            "units": [{"unit_id": row["unit_id"], "sha256": row["content_sha256"],
+                       "params": json.loads(row["params_json"])} for row in unit_rows],
+            "maintenance": {uid: sorted(hours) for uid, hours in sorted(blocked.items())},
+            "quote": curve_snapshot,
+            "inventory_version": inventory_sha256,
+        }
+        input_sha256 = digest(input_value)
+
+        existing = self.connection.execute(
+            "SELECT * FROM generation_plan_revisions WHERE plan_id=? ORDER BY revision DESC",
+            (request.plan_id,),
+        ).fetchall()
+        if existing:
+            latest = existing[0]
+            if latest["state"] == "approved":
+                raise InvalidState("计划已批准，不能重新计算")
+            same = self.connection.execute(
+                "SELECT * FROM generation_plan_revisions WHERE plan_id=? AND input_sha256=?",
+                (request.plan_id, input_sha256),
+            ).fetchone()
+            if same is not None:
+                return self._plan_response(same, replayed=True)
+
+        result = solve_schedule(
+            units=units,
+            blocked_hours=blocked,
+            prices=curve_prices,
+            load_mw=request.load_mw,
+            reserve_percent=request.reserve_percent,
+            fuel_unit_cost=fuel_unit_cost,
+            initial_output=request.initial_output_mw,
+        )
+        revision = 1 if not existing else max(row["revision"] for row in existing) + 1
+        fuel_demand = result.get("fuel_demand", "0.000")
+        try:
+            with transaction(self.connection, immediate=True):
+                if not existing:
+                    self.connection.execute(
+                        "INSERT INTO generation_plans(plan_id,trade_date,facility_id,product,current_revision,"
+                        "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (request.plan_id, request.trade_date, request.facility_id, request.product, revision,
+                         actor_id, self._now()),
+                    )
+                else:
+                    self.connection.execute(
+                        "UPDATE generation_plan_revisions SET state='superseded' WHERE plan_id=? AND state='draft'",
+                        (request.plan_id,),
+                    )
+                self.connection.execute(
+                    "INSERT INTO generation_plan_revisions(plan_id,revision,trade_date,facility_id,product,"
+                    "curve_id,request_json,input_sha256,quote_snapshot_json,feasible,result_json,conflicts_json,"
+                    "inventory_version_sha256,fuel_unit_cost_cny,fuel_demand,state,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (request.plan_id, revision, request.trade_date, request.facility_id, request.product,
+                     curve_snapshot.get("curve_id"), canonical_json(raw), input_sha256,
+                     canonical_json(curve_snapshot), 1 if result["feasible"] else 0,
+                     canonical_json(result), canonical_json(result["conflicts"]), inventory_sha256,
+                     decimal_text(fuel_unit_cost), fuel_demand, "draft", actor_id, self._now()),
+                )
+                self.connection.execute(
+                    "UPDATE generation_plans SET current_revision=? WHERE plan_id=?",
+                    (revision, request.plan_id),
+                )
+                row = self.connection.execute(
+                    "SELECT * FROM generation_plan_revisions WHERE plan_id=? AND revision=?",
+                    (request.plan_id, revision),
+                ).fetchone()
+                self._audit("generation_plan", request.plan_id, "plan.computed", actor_id,
+                            {"revision": revision, "feasible": result["feasible"],
+                             "input_sha256": input_sha256})
+        except sqlite3.IntegrityError as exc:  # 并发计算同一计划的同一修订号
+            raise Conflict("计划正在被并发计算，请重试") from exc
+        return self._plan_response(row, replayed=False)
+
+    def _plan_response(self, row: sqlite3.Row, *, replayed: bool) -> dict[str, Any]:
+        result = json.loads(row["result_json"])
+        return {
+            "plan_id": row["plan_id"],
+            "revision": row["revision"],
+            "state": row["state"],
+            "trade_date": row["trade_date"],
+            "facility_id": row["facility_id"],
+            "product": row["product"],
+            "curve_id": row["curve_id"],
+            "feasible": bool(row["feasible"]),
+            "input_sha256": row["input_sha256"],
+            "inventory_version_sha256": row["inventory_version_sha256"],
+            "approved_inventory_version_sha256": row["approved_inventory_version_sha256"],
+            "fuel_unit_cost_cny": row["fuel_unit_cost_cny"],
+            "replayed": replayed,
+            **result,
+        }
+
+    def get_plan(self, actor_id: str, plan_id: str, revision: int | None = None) -> dict[str, Any]:
+        self._require(actor_id, "plan.read")
+        row = self._plan_row(plan_id, revision)
+        return self._plan_response(row, replayed=False)
+
+    def _plan_row(self, plan_id: str, revision: int | None = None) -> sqlite3.Row:
+        if revision is None:
+            row = self.connection.execute(
+                "SELECT * FROM generation_plan_revisions WHERE plan_id=? ORDER BY revision DESC LIMIT 1",
+                (plan_id,),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT * FROM generation_plan_revisions WHERE plan_id=? AND revision=?",
+                (plan_id, revision),
+            ).fetchone()
+        if row is None:
+            raise NotFound("计划不存在")
+        return row
+
+    def approve_plan(self, actor_id: str, plan_id: str, expected_revision: int) -> dict[str, Any]:
+        """批准草稿并以当前库存版本原子预留燃料；重复批准幂等。"""
+        self._require(actor_id, "plan.approve")
+        row = self.connection.execute(
+            "SELECT * FROM generation_plan_revisions WHERE plan_id=? AND revision=?",
+            (plan_id, expected_revision),
+        ).fetchone()
+        if row is None:
+            latest = self.connection.execute(
+                "SELECT revision,state FROM generation_plan_revisions WHERE plan_id=? ORDER BY revision DESC LIMIT 1",
+                (plan_id,),
+            ).fetchone()
+            if latest is None:
+                raise NotFound("计划不存在")
+            raise Conflict(f"期望修订 {expected_revision} 不是最新修订 {latest['revision']}")
+        if row["state"] == "approved":
+            return self._plan_response(row, replayed=True)
+        if row["state"] != "draft":
+            raise InvalidState("只有草稿计划可以批准")
+        if not row["feasible"]:
+            raise InvalidState("无解草稿不能批准")
+        fuel_demand = Decimal(row["fuel_demand"])
+        with transaction(self.connection, immediate=True):
+            approval_version, _ = self._inventory_version(row["facility_id"], row["product"])
+            if approval_version != row["inventory_version_sha256"]:
+                raise Conflict("库存版本自草稿计算后已变化，请重新计算后再批准")
+            lots = self.connection.execute(
+                "SELECT * FROM inventory_lots WHERE facility_id=? AND product=? ORDER BY received_at,lot_id",
+                (row["facility_id"], row["product"]),
+            ).fetchall()
+            available_total = sum((Decimal(lot["available_mwh"]) for lot in lots), ZERO)
+            if available_total < fuel_demand:
+                raise Conflict(
+                    f"燃料库存不足以批准计划：需要 {decimal_text(fuel_demand)}，"
+                    f"可用 {decimal_text(quantize_volume(available_total))}"
+                )
+            remaining = fuel_demand
+            for lot in lots:
+                if remaining <= ZERO:
+                    break
+                take = min(Decimal(lot["available_mwh"]), remaining)
+                if take <= ZERO:
+                    continue
+                self.connection.execute(
+                    "UPDATE inventory_lots SET available_mwh=?,revision=revision+1 WHERE lot_id=?",
+                    (decimal_text(quantize_volume(Decimal(lot["available_mwh"]) - take)), lot["lot_id"]),
+                )
+                self.connection.execute(
+                    "INSERT INTO plan_fuel_reservations(plan_id,revision,lot_id,lot_revision,reserved_mwh,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (plan_id, expected_revision, lot["lot_id"], lot["revision"] + 1,
+                     decimal_text(quantize_volume(take)), self._now()),
+                )
+                remaining -= take
+            cursor = self.connection.execute(
+                "UPDATE generation_plan_revisions SET state='approved',approved_by=?,approved_at=?,"
+                "approved_inventory_version_sha256=? "
+                "WHERE plan_id=? AND revision=? AND state='draft'",
+                (actor_id, self._now(), approval_version, plan_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("计划状态已变化")
+            self._audit("generation_plan", plan_id, "plan.approved", actor_id,
+                        {"revision": expected_revision, "fuel_demand": row["fuel_demand"],
+                         "inventory_version": row["inventory_version_sha256"]})
+        approved = self.connection.execute(
+            "SELECT * FROM generation_plan_revisions WHERE plan_id=? AND revision=?",
+            (plan_id, expected_revision),
+        ).fetchone()
+        return self._plan_response(approved, replayed=False)
+
+    def record_actual(self, actor_id: str, plan_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """登记计划日实际逐时出力，计算与原方案的偏差。重复登记幂等。"""
+        self._require(actor_id, "actual.write")
+        actual_outputs = raw.get("outputs_mw")
+        if not isinstance(actual_outputs, Mapping):
+            raise ValidationFailed("outputs_mw 必须是以机组为键的 24 点出力对象")
+        series: dict[str, list[Decimal]] = {}
+        for uid, values in actual_outputs.items():
+            unit_id = identifier(uid, "outputs_mw 键")
+            if not isinstance(values, (list, tuple)) or len(values) != 24:
+                raise ValidationFailed(f"outputs_mw.{unit_id} 必须是 24 个小时点")
+            series[unit_id] = [
+                decimal_value(point, f"outputs_mw.{unit_id}[{index}]", minimum=ZERO)
+                for index, point in enumerate(values)
+            ]
+        plan = self.connection.execute(
+            "SELECT * FROM generation_plan_revisions WHERE plan_id=? ORDER BY revision DESC LIMIT 1",
+            (plan_id,),
+        ).fetchone()
+        if plan is None:
+            raise NotFound("计划不存在")
+        if plan["state"] != "approved":
+            raise InvalidState("只有已批准计划可以登记实际出力")
+        result = json.loads(plan["result_json"])
+        known = {row["unit_id"] for row in result["units"]}
+        unknown = sorted(set(series) - known)
+        if unknown:
+            raise ValidationFailed(f"实际出力包含计划外机组: {','.join(unknown)}")
+        actual_payload = {
+            uid: [decimal_text(value) for value in values] for uid, values in sorted(series.items())
+        }
+        content = canonical_json(
+            {"plan_id": plan_id, "revision": plan["revision"], "outputs_mw": actual_payload}
+        )
+        content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        existing = self.connection.execute(
+            "SELECT * FROM plan_actuals WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing["content_sha256"] != content_sha256:
+                raise Conflict("该计划已登记不同内容的实际出力")
+            return self._deviation_report(plan, result, json.loads(existing["actual_json"]), replayed=True)
+
+        deviation = self._build_deviation(result, series)
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO plan_actuals(plan_id,actual_json,content_sha256,recorded_by,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (plan_id, canonical_json(actual_payload), content_sha256, actor_id, self._now()),
+            )
+            self._audit("generation_plan", plan_id, "plan.actual_recorded", actor_id,
+                        {"revision": plan["revision"], "sha256": content_sha256})
+        return self._deviation_report(plan, result, actual_payload, replayed=False)
+
+    @staticmethod
+    def _build_deviation(result: Mapping[str, Any], actual: Mapping[str, list[Decimal]]) -> dict[str, Any]:
+        hours = []
+        total_abs = ZERO
+        for planned_hour in result["hours"]:
+            hour = planned_hour["hour"]
+            planned_outputs = {uid: Decimal(value) for uid, value in planned_hour["outputs_mw"].items()}
+            actual_outputs = {uid: values[hour] for uid, values in actual.items()}
+            unit_rows = []
+            for uid in sorted(set(planned_outputs) | set(actual_outputs)):
+                planned = planned_outputs.get(uid, ZERO)
+                observed = actual_outputs.get(uid, ZERO)
+                delta = qmw(observed - planned)
+                total_abs += abs(delta)
+                unit_rows.append({
+                    "unit_id": uid,
+                    "planned_mw": decimal_text(planned),
+                    "actual_mw": decimal_text(observed),
+                    "delta_mw": decimal_text(delta),
+                })
+            planned_generation = Decimal(planned_hour["generation_mw"])
+            actual_generation = sum(actual_outputs.values(), ZERO)
+            hours.append({
+                "hour": hour,
+                "planned_generation_mw": decimal_text(planned_generation),
+                "actual_generation_mw": decimal_text(qmw(actual_generation)),
+                "generation_delta_mw": decimal_text(qmw(actual_generation - planned_generation)),
+                "units": unit_rows,
+            })
+        actual_payload = {
+            uid: [decimal_text(value) for value in values] for uid, values in sorted(actual.items())
+        }
+        return {
+            "actual": actual_payload,
+            "hours": hours,
+            "total_abs_deviation_mwh": decimal_text(qmw(total_abs)),
+        }
+
+    def _deviation_report(
+        self, plan: sqlite3.Row, result: Mapping[str, Any], actual_payload: Mapping[str, Any], *, replayed: bool
+    ) -> dict[str, Any]:
+        actual = {uid: [Decimal(v) for v in values] for uid, values in actual_payload.items()}
+        deviation = self._build_deviation(result, actual)
+        return {
+            "plan_id": plan["plan_id"],
+            "plan_revision": plan["revision"],
+            "plan_state": plan["state"],
+            "replayed": replayed,
+            "actual": deviation["actual"],
+            "hours": deviation["hours"],
+            "total_abs_deviation_mwh": deviation["total_abs_deviation_mwh"],
+        }
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")

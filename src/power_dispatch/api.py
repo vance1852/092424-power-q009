@@ -83,6 +83,27 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/price-curves":
+                return Response(201, self.service.record_price_curve(actor, payload))
+            if method == "GET" and path == "/price-curves":
+                return Response(200, self.service.price_curve(
+                    actor, query.get("market_index", [""])[0], query.get("trade_date", [""])[0]))
+            if method == "POST" and path == "/units":
+                return Response(201, self.service.register_unit(actor, payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "units" and parts[2] == "maintenance":
+                return Response(201, self.service.declare_maintenance(
+                    actor, parts[1], payload["trade_date"], int(payload["start_hour"]),
+                    int(payload["end_hour"]), payload["reason"]))
+            if method == "POST" and path == "/plans":
+                return Response(201, self.service.compute_plan(actor, payload))
+            if method == "GET" and len(parts) == 2 and parts[0] == "plans":
+                revision = query.get("revision", [""])[0]
+                return Response(200, self.service.get_plan(
+                    actor, parts[1], int(revision) if revision else None))
+            if method == "POST" and len(parts) == 3 and parts[0] == "plans" and parts[2] == "approve":
+                return Response(200, self.service.approve_plan(actor, parts[1], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "plans" and parts[2] == "actuals":
+                return Response(201, self.service.record_actual(actor, parts[1], payload))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
